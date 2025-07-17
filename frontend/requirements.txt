@@ -1,0 +1,17 @@
+streamlit
+beautifulsoup4
+google-generativeai
+langchain==0.1.14
+huggingface-hub
+transformers
+sentence-transformers
+python-dotenv
+Pillow
+PyPDF2
+gtts
+pydub
+SpeechRecognition
+streamlit-mic-recorder
+python-multipart
+sentencepiece
+requests
