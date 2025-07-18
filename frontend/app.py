@@ -1,9 +1,11 @@
 #frontend/app.py
+
 import streamlit as st
 import requests
 from mic_utils import record_and_transcribe 
 from tts_utils import speak_text, generate_audio_html
 from ner_display import display_ner_highlighted
+
 import os
 import torch
 from transformers import pipeline
@@ -14,10 +16,44 @@ from io import BytesIO
 from pydub import AudioSegment
 import tempfile
 from PIL import Image, UnidentifiedImageError
-from dotenv import load_dotenv
-import google.generativeai as genai
 import json
 import requests
+
+# Ensure .env is loaded and Gemini API is configured globally
+from dotenv import load_dotenv
+import google.generativeai as genai
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception:
+        pass
+
+# -------------------------
+# Shared Prompt Template for Gemini Analysis
+# ------------------------- 
+PROMPT_TEMPLATE = """
+You are a highly skilled medical expert with specializations across multiple fields like radiology, ophthalmology, and dermatology. Your task is to analyze the provided image or PDF report.
+
+**Instructions:**
+1.  **Identify the Image or Report Type:** First, determine the type of medical image or report (e.g., X-ray of a bone, clinical photograph of an eye, dermatological image of a skin condition, lab report, etc.).
+2.  **Adopt the Correct Persona:** Based on the type, adopt the appropriate expert role.
+    *   For an X-ray, act as a **Radiologist**.
+    *   For an eye image, act as an **Ophthalmologist**.
+    *   For a skin image, act as a **Dermatologist**.
+    *   For a lab report, act as a **General Physician** or relevant specialist.
+    *   For other images or reports, use your best judgment to select a relevant medical expert role.
+3.  **Provide a Structured Report:** Generate a detailed analysis in a structured format using markdown. The report should include the following sections:
+    *   `### Role Adopted:` (State the expert role you have taken on).
+    *   `### Observations:` (Describe what you see in the image or report in medical terms).
+    *   `### Impression / Potential Diagnosis:` (Provide a potential diagnosis or impression based on the visual evidence).
+    *   `### Recommendations:` (Suggest potential next steps, such as specific tests or consultation with a specialist).
+4.  **Crucial Disclaimer:** Conclude your analysis with the following mandatory disclaimer, formatted exactly as shown:
+
+---
+***Disclaimer:*** This is an AI-generated analysis for educational and informational purposes only. It is **NOT** a substitute for a professional medical diagnosis. Please consult a qualified healthcare provider for any health concerns.*
+"""
 
 # -------------------------
 # Load Translations
@@ -59,11 +95,41 @@ def translate_answer(text, lang_code):
     if not model_name:
         return text
     try:
-        result = pipeline("translation", model=model_name)(text, max_length=512)
-        if result and isinstance(result, list) and 'translation_text' in result[0]:
-            return result[0]['translation_text']
-        else:
+        # Split text into markdown blocks (headers, paragraphs, lists, etc.)
+        import re
+        blocks = re.split(r'(\n+)', text)
+        translated_blocks = []
+        translator = pipeline("translation", model=model_name)
+        for block in blocks:
+            # Only translate non-empty, non-whitespace, non-markdown header lines
+            if block.strip() and not re.match(r'^\s*#', block):
+                translated_block = translator(block, max_length=512)[0]['translation_text']
+            else:
+                translated_block = block
+            translated_blocks.append(translated_block)
+        translated = ''.join(translated_blocks)
+        # Post-process: Remove repeated lines/words and garbled output
+        # Remove consecutive duplicate lines
+        lines = translated.splitlines()
+        cleaned_lines = []
+        prev_line = None
+        for line in lines:
+            if line.strip() and line != prev_line:
+                cleaned_lines.append(line)
+            prev_line = line
+        cleaned = '\n'.join(cleaned_lines)
+        # Remove repeated words (3+ times in a row)
+        cleaned = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', cleaned)
+        # Remove obvious gibberish patterns (e.g., 5+ same char in a row)
+        cleaned = re.sub(r'(\w)\1{4,}', r'\1', cleaned)
+        cleaned = cleaned.strip()
+        # Fallback: If translation is empty, return English
+        if not cleaned:
             return text
+        # If translation is mostly non-native script (e.g., Latin for Hindi), fallback
+        if lang_code == 'hi' and re.fullmatch(r'[\x00-\x7F\s.,!?\-:;\(\)\[\]"\']*', cleaned):
+            return text
+        return cleaned
     except Exception as e:
         return f"❌ Translation error: {e}"
 
@@ -135,8 +201,6 @@ for key in ["image_analysis_displayed", "pdf_analysis_displayed"]:
         st.session_state[key] = False
 
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
-
 # -------------------------
 # Global Inputs (Language & Role)
 # -------------------------
@@ -162,24 +226,15 @@ input_lang = st.sidebar.selectbox(
 simple_explanation = st.sidebar.checkbox("📖 Simple explanation mode (for kids / non-experts)")
 tone = st.sidebar.selectbox("🧘 Tone:", ["formal", "friendly", "child"])
 
-role_map = {
-    "radiologist": "Radiologist",
-    "general_physician": "General Physician",
-    "orthopedist": "Orthopedist",
-    "cardiologist": "Cardiologist",
-    "neurologist": "Neurologist",
-    "dermatologist": "Dermatologist",
-    "pediatrician": "Pediatrician",
-    "dentist": "Dentist"
-}
-role = st.sidebar.selectbox("👨‍⚕️ Medical Expert Role:", list(role_map.keys()), format_func=lambda x: role_map[x])
-if not role or not isinstance(role, str):
-    role = "general_physician"
+## Medical expert role option removed
 
 # -------------------------
 # Home Page
 # -------------------------
 
+
+disclaimer_text = TRANSLATIONS[output_lang].get("disclaimer", TRANSLATIONS["en"]["disclaimer"])
+st.markdown(f"**{disclaimer_text}**")
 
 if page == "🏞️ Home":
     t = TRANSLATIONS[output_lang]
@@ -197,51 +252,91 @@ if page == "🖼️ Image Analysis":
     st.subheader("🖼️ " + t["image_upload"])
     image_file = st.file_uploader(t["image_upload"], type=["png", "jpg", "jpeg"])
 
-    if image_file:
+    # Gemini AI Image Analysis Block
+    # st.markdown(f"### {t.get('gemini_image_analysis_title', 'AI Image Analysis (Gemini)')}")
+    # st.markdown(t.get('gemini_image_analysis_disclaimer', "**For Educational Use Only.** This tool uses a general-purpose AI and is not a certified medical device. Do not use it for self-diagnosis. Always consult a real doctor."))
+
+    # --- Gemini Imports and Setup ---
+    import google.generativeai as genai
+    import io
+    from dotenv import load_dotenv
+    load_dotenv()
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        st.error(f"{t.get('gemini_image_analysis_error_config', 'Error configuring Gemini API:')} GEMINI_API_KEY not found.")
+        st.error(t.get('gemini_image_analysis_error_key', 'Please make sure you have a GEMINI_API_KEY in your .env file in the root directory.'))
+    else:
         try:
-            image_bytes = image_file.read()
-            img = Image.open(BytesIO(image_bytes))
-            st.image(img, caption=t["image_upload"])
-            image_file.seek(0)
-            with st.spinner(t["image_analysis"] + "..."):
+            genai.configure(api_key=gemini_api_key)
+        except Exception as e:
+            st.error(f"{t.get('gemini_image_analysis_error_config', 'Error configuring Gemini API:')} {e}")
+            st.stop()
+
+    PROMPT_TEMPLATE = """
+You are a highly skilled medical expert with specializations across multiple fields like radiology, ophthalmology, and dermatology. Your task is to analyze the provided image.
+
+**Instructions:**
+1.  **Identify the Image Type:** First, determine the type of medical image (e.g., X-ray of a bone, clinical photograph of an eye, dermatological image of a skin condition, etc.).
+2.  **Adopt the Correct Persona:** Based on the image type, adopt the appropriate expert role.
+    *   For an X-ray, act as a **Radiologist**.
+    *   For an eye image, act as an **Ophthalmologist**.
+    *   For a skin image, act as a **Dermatologist**.
+    *   For other images, use your best judgment to select a relevant medical expert role.
+3.  **Provide a Structured Report:** Generate a detailed analysis in a structured format using markdown. The report should include the following sections:
+    *   `### Role Adopted:` (State the expert role you have taken on).
+    *   `### Observations:` (Describe what you see in the image in medical terms).
+    *   `### Impression / Potential Diagnosis:` (Provide a potential diagnosis or impression based on the visual evidence).
+    *   `### Recommendations:` (Suggest potential next steps, such as specific tests or consultation with a specialist).
+4.  **Crucial Disclaimer:** Conclude your analysis with the following mandatory disclaimer, formatted exactly as shown:
+
+---
+***Disclaimer:*** This is an AI-generated analysis for educational and informational purposes only. It is **NOT** a substitute for a professional medical diagnosis. Please consult a qualified healthcare provider for any health concerns.*
+"""
+
+
+    if image_file is not None:
+        image_bytes = image_file.read()
+        st.subheader(t.get('gemini_image_analysis_uploaded_image', 'Uploaded Image'))
+        st.image(image_bytes, caption=t.get('gemini_image_analysis_uploaded_image', 'Image ready for analysis'), use_container_width=False, width=None, output_format="auto")
+        st.markdown("<style>img {max-height: 350px !important; height: 350px !important; object-fit: contain;}</style>", unsafe_allow_html=True)
+        st.subheader(t.get('gemini_image_analysis_ai_analysis', 'AI Analysis'))
+        if st.button(t.get('gemini_image_analysis_button', 'Analyze Image'), type="primary") or ("image_analysis_done" not in st.session_state):
+            with st.spinner(t.get('gemini_image_analysis_spinner', 'The AI expert is examining the image... Please wait.')):
                 try:
-                    res = requests.post(f"{BACKEND_URL}/analyze_image", files={"image": image_file})
-                    if res.status_code != 200:
-                        st.error(f"❌ {t['backend_error']}: {res.status_code} - {res.text}")
-                        result = None
-                    else:
-                        try:
-                            result = res.json().get("analysis", "❌ Failed to get analysis")
-                        except Exception as e:
-                            result = f"❌ Invalid backend response: {e}"
-                except requests.exceptions.ConnectionError as ce:
-                    st.error(f"❌ {t['backend_error']}: Connection error. Backend may be unavailable.")
-                    result = None
+                    from PIL import Image as PILImage
+                    image_part = PILImage.open(io.BytesIO(image_bytes))
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    response = model.generate_content([PROMPT_TEMPLATE, image_part])
+                    analysis_text = response.text
+                    translated_analysis = translate_answer(analysis_text, output_lang)
+                    # Extract role from analysis_text (look for '### Role Adopted:' section)
+                    import re
+                    match = re.search(r'### Role Adopted:\s*(.*)', analysis_text)
+                    extracted_role = match.group(1).strip() if match else "General Physician"
+                    st.session_state.image_analysis_role = extracted_role
                 except Exception as e:
-                    st.error(f"❌ {t['backend_error']}: {e}")
-                    result = None
-                if result:
-                    translated_result = translate_answer(result, output_lang)
-                    st.session_state.image_analysis = translated_result
-                    st.session_state.image_analysis_displayed = False
-                    st.session_state.image_messages = []
-        except UnidentifiedImageError:
-            st.error("❌ " + t.get("analysis_error", "Error: Unsupported image format."))
+                    translated_analysis = f"{t.get('gemini_image_analysis_error', 'An error occurred during AI analysis:')} {e}"
+                    st.session_state.image_analysis_role = "General Physician"
+                st.session_state.image_analysis = translated_analysis
+                st.session_state.image_analysis_displayed = False
+                st.session_state.image_messages = []
+                st.session_state["image_analysis_done"] = True
+                st.session_state["image_analysis_did_you_understand"] = False
+        if st.session_state.get("image_analysis_done"):
+            st.markdown(st.session_state.image_analysis)
+            if st.button(t.get('gemini_image_analysis_voice', '🔊 Listen to AI Analysis'), key="gemini_voice"):
+                st.session_state["gemini_image_analysis_spoken"] = False
+            if not st.session_state.get("gemini_image_analysis_spoken", False):
+                st.components.v1.html(generate_audio_html(st.session_state.image_analysis, lang=output_lang, key="gemini_image_analysis"), height=100)
+                st.session_state["gemini_image_analysis_spoken"] = True
+
+
+
 
     if st.session_state.image_analysis:
         st.divider()
         st.subheader("💬 " + t["ask_image_question"])
-
-        if not st.session_state.image_analysis_displayed:
-            with st.chat_message("assistant"):
-                st.markdown(st.session_state.image_analysis)
-                st.session_state.image_analysis_spoken = False
-                if st.button("🔊 Resume Audio", key="resume_image_analysis"):
-                    st.session_state.image_analysis_spoken = False
-                if not st.session_state.image_analysis_spoken:
-                    st.components.v1.html(generate_audio_html(st.session_state.image_analysis, lang=output_lang, key="image_analysis"), height=100)
-                    st.session_state.image_analysis_spoken = True
-            st.session_state.image_analysis_displayed = True
+        # Do NOT repeat the analysis here. Only show chat below.
 
         user_input = st.chat_input(t["ask_image_question"], key="image_chat")
 
@@ -251,22 +346,26 @@ if page == "🖼️ Image Analysis":
                 history = [f"Image Analysis: {st.session_state.image_analysis}"]
                 for role_msg, msg in st.session_state.image_messages:
                     history.append(f"{role_msg.capitalize()}: {msg}")
-                # Ensure role is always a string and fallback to 'general_physician' if missing
-                role_value = str(role) if role else "general_physician"
-                if not role_value or role_value == "None":
-                    role_value = "general_physician"
-                payload = {
-                    "question": user_input,
-                    "context": "\n".join(history),
-                    "tone": tone,
-                    "role": role_value,
-                    "simplify": simple_explanation
-                }
-                res = requests.post(f"{BACKEND_URL}/ask", data=payload)
+                chat_history = "\n".join(history)
                 try:
-                    answer = res.json().get("answer", "❌ No response")
-                except:
-                    answer = "❌ Invalid response from backend."
+                    gemini_api_key = os.getenv("GEMINI_API_KEY")
+                    if not gemini_api_key:
+                        raise Exception("GEMINI_API_KEY not found.")
+                    genai.configure(api_key=gemini_api_key)
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    prompt = f"""
+You are a helpful medical assistant chatbot. Use the following chat history and answer the user's latest question. Be concise, clear, and medically accurate. If you don't know, say so.
+
+Chat History:
+{chat_history}
+
+User's latest question:
+{user_input}
+"""
+                    response = model.generate_content(prompt)
+                    answer = response.text
+                except Exception as e:
+                    answer = f"❌ Gemini error: {e}"
                 translated_answer = translate_answer(answer, output_lang)
                 st.session_state.image_messages.append(("assistant", translated_answer))
 
@@ -286,45 +385,101 @@ if page == "🖼️ Image Analysis":
 
 
 if page == "📄 PDF Report Analysis":
+
     t_pdf = TRANSLATIONS.get(output_lang, TRANSLATIONS["en"])
     st.subheader("📄 " + t_pdf.get("pdf_upload", TRANSLATIONS["en"]["pdf_upload"]))
-    pdf_file = st.file_uploader(t_pdf.get("pdf_upload", TRANSLATIONS["en"]["pdf_upload"]), type=["pdf"])
+    pdf_file = st.file_uploader(t_pdf.get("pdf_upload", TRANSLATIONS["en"]["pdf_upload"]), type=["pdf", "jpg", "jpeg", "png"])
 
-    if pdf_file:
-        with st.spinner(t_pdf.get("pdf_analysis", TRANSLATIONS["en"]["pdf_analysis"]) + "..."):
-            pdf_file.seek(0)
+    # Gemini PDF/Image Analysis (frontend, like image analysis)
+    import fitz
+    import io
+    from dotenv import load_dotenv
+    load_dotenv()
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        st.error(f"{t_pdf.get('gemini_image_analysis_error_config', 'Error configuring Gemini API:')} GEMINI_API_KEY not found.")
+        st.error(t_pdf.get('gemini_image_analysis_error_key', 'Please make sure you have a GEMINI_API_KEY in your .env file in the root directory.'))
+    else:
+        try:
+            genai.configure(api_key=gemini_api_key)
+        except Exception as e:
+            st.error(f"{t_pdf.get('gemini_image_analysis_error_config', 'Error configuring Gemini API:')} {e}")
+            st.stop()
+
+    def process_uploaded_file(uploaded_file):
+        if uploaded_file.type == "application/pdf":
+            images = []
             try:
-                res = requests.post(f"{BACKEND_URL}/upload_pdf", files={"file": pdf_file})
-                if res.status_code != 200:
-                    st.error(f"❌ {t_pdf.get('backend_error', TRANSLATIONS['en']['backend_error'])}: {res.status_code} - {res.text}")
-                    result = None
-                else:
-                    res_json = res.json()
-                    result = res_json.get("content", "❌ Failed to analyze PDF")
+                pdf_document = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+                for page_num in range(len(pdf_document)):
+                    page = pdf_document.load_page(page_num)
+                    pix = page.get_pixmap(dpi=300)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    images.append(img)
+                pdf_document.close()
+                return images
             except Exception as e:
-                st.error(f"❌ {t_pdf.get('analysis_error', TRANSLATIONS['en']['analysis_error'])}: {e}")
-                result = None
+                st.error(f"Error processing PDF file: {e}")
+                return None
+        else:
+            try:
+                return [Image.open(uploaded_file)]
+            except Exception as e:
+                st.error(f"Error processing image file: {e}")
+                return None
 
-            if result:
-                translated_result = translate_answer(result, output_lang)
-                st.session_state.pdf_analysis = translated_result
-                st.session_state.pdf_analysis_displayed = False
-                st.session_state.pdf_messages = []
+    def get_gemini_analysis(list_of_pil_images, prompt):
+        if not list_of_pil_images:
+            return "Could not process the uploaded file. Please try again."
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            content = [prompt]
+            content.extend(list_of_pil_images)
+            response = model.generate_content(content)
+            return response.text
+        except Exception as e:
+            return f"An error occurred during AI analysis: {e}"
+
+
+    if pdf_file is not None:
+        pil_images = process_uploaded_file(pdf_file)
+        if pil_images:
+            st.subheader("Uploaded Report Preview")
+            num_pages = len(pil_images)
+            if num_pages > 1:
+                page_num = st.number_input("Page", min_value=1, max_value=num_pages, value=1, step=1, key="pdf_page_select")
+                st.image(pil_images[page_num-1], caption=f"Preview (Page {page_num} of {num_pages})", use_container_width=False, width=None, output_format="auto")
+            else:
+                st.image(pil_images[0], caption=f"Preview (Page 1 of 1)", use_container_width=False, width=None, output_format="auto")
+            st.markdown("<style>img {max-height: 350px !important; height: 350px !important; object-fit: contain;}</style>", unsafe_allow_html=True)
+            st.subheader("AI-Powered Explanation")
+            if st.button("Analyze Lab Report", type="primary") or ("pdf_analysis_done" not in st.session_state):
+                with st.spinner('The AI physician is reviewing the report... Please wait.'):
+                    analysis_text = get_gemini_analysis(pil_images, PROMPT_TEMPLATE)
+                    translated_analysis = translate_answer(analysis_text, output_lang)
+                    # Extract role from analysis_text (look for '### Role Adopted:' section)
+                    import re
+                    match = re.search(r'### Role Adopted:\s*(.*)', analysis_text)
+                    extracted_role = match.group(1).strip() if match else "General Physician"
+                    st.session_state.pdf_analysis_role = extracted_role
+                    st.session_state.pdf_analysis = translated_analysis
+                    st.session_state.pdf_analysis_displayed = False
+                    st.session_state.pdf_messages = []
+                    st.session_state["pdf_analysis_done"] = True
+                    st.session_state["pdf_analysis_did_you_understand"] = False
+            if st.session_state.get("pdf_analysis_done"):
+                st.markdown(st.session_state.pdf_analysis)
+                if st.button("🔊 Listen to AI Analysis", key="gemini_pdf_voice"):
+                    st.session_state["gemini_pdf_analysis_spoken"] = False
+                if not st.session_state.get("gemini_pdf_analysis_spoken", False):
+                    st.components.v1.html(generate_audio_html(st.session_state.pdf_analysis, lang=output_lang, key="gemini_pdf_analysis"), height=100)
+                    st.session_state["gemini_pdf_analysis_spoken"] = True
+
 
     if st.session_state.pdf_analysis:
         st.divider()
         st.subheader("📁 " + t_pdf.get("ask_pdf_question", TRANSLATIONS["en"]["ask_pdf_question"]))
-
-        if not st.session_state.pdf_analysis_displayed:
-            with st.chat_message("assistant"):
-                st.markdown(st.session_state.pdf_analysis)
-                st.session_state.pdf_analysis_spoken = False
-                if st.button("🔊 Resume Audio", key="resume_pdf_analysis"):
-                    st.session_state.pdf_analysis_spoken = False
-                if not st.session_state.pdf_analysis_spoken:
-                    st.components.v1.html(generate_audio_html(st.session_state.pdf_analysis, lang=output_lang, key="pdf_analysis"), height=100)
-                    st.session_state.pdf_analysis_spoken = True
-            st.session_state.pdf_analysis_displayed = True
+        # Do NOT repeat the analysis here. Only show chat below.
 
         user_input = st.chat_input(t_pdf.get("ask_pdf_question", TRANSLATIONS["en"]["ask_pdf_question"]), key="pdf_chat")
 
@@ -334,18 +489,26 @@ if page == "📄 PDF Report Analysis":
                 history = [f"PDF Analysis: {st.session_state.pdf_analysis}"]
                 for role_msg, msg in st.session_state.pdf_messages:
                     history.append(f"{role_msg.capitalize()}: {msg}")
-                payload = {
-                    "question": user_input,
-                    "context": "\n".join(history),
-                    "tone": tone,
-                    "role": str(role) if role else "general_physician",
-                    "simplify": simple_explanation
-                }
-                res = requests.post(f"{BACKEND_URL}/ask", data=payload)
+                chat_history = "\n".join(history)
                 try:
-                    answer = res.json().get("answer", "❌ No response")
-                except:
-                    answer = "❌ Invalid response from backend."
+                    gemini_api_key = os.getenv("GEMINI_API_KEY")
+                    if not gemini_api_key:
+                        raise Exception("GEMINI_API_KEY not found.")
+                    genai.configure(api_key=gemini_api_key)
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    prompt = f"""
+You are a helpful medical assistant chatbot. Use the following chat history and answer the user's latest question. Be concise, clear, and medically accurate. If you don't know, say so.
+
+Chat History:
+{chat_history}
+
+User's latest question:
+{user_input}
+"""
+                    response = model.generate_content(prompt)
+                    answer = response.text
+                except Exception as e:
+                    answer = f"❌ Gemini error: {e}"
                 translated_answer = translate_answer(answer, output_lang)
                 st.session_state.pdf_messages.append(("assistant", translated_answer))
 
@@ -366,15 +529,7 @@ if page == "📄 PDF Report Analysis":
 
 
 if page == "🎙️ Voice Q&A":
-    # Add a dedicated language selector for Voice Q&A UI
-    voice_ui_lang = st.selectbox(
-        "🌐 Voice Q&A UI language:",
-        list(language_map.keys()),
-        index=list(language_map.keys()).index(output_lang),
-        format_func=lambda x: language_map[x],
-        key="voice_ui_lang_selectbox"
-    )
-    t_voice = TRANSLATIONS.get(voice_ui_lang, TRANSLATIONS["en"])
+    t_voice = TRANSLATIONS.get(output_lang, TRANSLATIONS["en"])
     st.title("🎙️ " + t_voice.get("voice_title", TRANSLATIONS["en"].get("voice_title", "Voice Q&A")))
     st.markdown(t_voice.get("voice_instruction", TRANSLATIONS["en"].get("voice_instruction", "Speak your question below.")))
 
@@ -391,6 +546,7 @@ if page == "🎙️ Voice Q&A":
     st.write("🎤 " + t_voice.get("voice_input", TRANSLATIONS["en"]["voice_input"]))
     spoken_text = record_and_transcribe(lang=lang_code_map.get(input_lang, "en-US"))
 
+
     if spoken_text and not spoken_text.startswith("❌"):
         st.session_state.messages.append(("user", spoken_text))
         st.markdown("**" + t_voice.get("voice_response", TRANSLATIONS["en"]["voice_response"]) + "**")
@@ -399,24 +555,27 @@ if page == "🎙️ Voice Q&A":
         # Translate to English if needed
         translated_question = translate_question(spoken_text, input_lang)
 
-        # Prepare payload
-        payload = {
-            "question": translated_question,
-            "context": "",
-            "tone": tone,
-            "role": str(role),
-            "simplify": simple_explanation
-        }
+        # Compose chat history for context (Voice Q&A is stateless, so just use the question)
+        chat_history = f"User: {translated_question}"
 
-        # Get answer from backend (no timeout limit)
+        # Use Gemini directly for answer
         with st.spinner("Thinking..."):
             try:
-                res = requests.post(f"{BACKEND_URL}/ask", data=payload)
-                answer = res.json().get("answer", "❌ No response")
-            except requests.exceptions.ConnectionError:
-                answer = "❌ Backend connection error: Unable to reach the server. Please check if the backend is running."
+                gemini_api_key = os.getenv("GEMINI_API_KEY")
+                if not gemini_api_key:
+                    raise Exception("GEMINI_API_KEY not found.")
+                genai.configure(api_key=gemini_api_key)
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                prompt = f"""                                                                                                                                                                                                                                                                           
+You are a helpful medical assistant chatbot. Use the following chat history and answer the user's latest question. Be concise, clear, and medically accurate. If you don't know, say so.
+
+Chat History:
+{chat_history}
+"""
+                response = model.generate_content(prompt)
+                answer = response.text
             except Exception as e:
-                answer = f"❌ Invalid response from backend: {e}"
+                answer = f"❌ Gemini error: {e}"
 
         translated_answer = translate_answer(answer, output_lang)
         st.session_state.messages.append(("assistant", translated_answer))
@@ -457,6 +616,7 @@ if page == "💬 Chatbot Q&A":
             st.session_state.messages.append(("assistant", t.get("greeting", TRANSLATIONS["en"]["greeting"])))
         else:
             with st.spinner("Thinking..."):
+                # Compose chat history for context
                 history = []
                 for role_msg, msg in st.session_state.messages:
                     if role_msg == "user":
@@ -468,20 +628,26 @@ if page == "💬 Chatbot Q&A":
                 if st.session_state.pdf_analysis:
                     history.append(f"PDF Analysis: {st.session_state.pdf_analysis}")
                 chat_history = "\n".join(history)
-                payload = {
-                    "question": user_msg,
-                    "context": chat_history,
-                    "tone": tone,
-                    "role": str(role) if role else "general_physician",
-                    "simplify": True
-                }
+                # Use Gemini directly for answer
                 try:
-                    res = requests.post(f"{BACKEND_URL}/ask", data=payload)
-                    answer = res.json().get("answer", "❌ No response")
-                except requests.exceptions.ConnectionError:
-                    answer = "❌ Backend connection error: Unable to reach the server. Please check if the backend is running."
+                    gemini_api_key = os.getenv("GEMINI_API_KEY")
+                    if not gemini_api_key:
+                        raise Exception("GEMINI_API_KEY not found.")
+                    genai.configure(api_key=gemini_api_key)
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    prompt = f"""
+You are a helpful medical assistant chatbot. Use the following chat history and answer the user's latest question. Be concise, clear, and medically accurate. If you don't know, say so.
+
+Chat History:
+{chat_history}
+
+User's latest question:
+{user_msg}
+"""
+                    response = model.generate_content(prompt)
+                    answer = response.text
                 except Exception as e:
-                    answer = f"❌ Unexpected error: {e}"
+                    answer = f"❌ Gemini error: {e}"
                 translated_answer = translate_answer(answer, output_lang)
                 st.session_state.messages.append(("assistant", translated_answer))
 
@@ -503,15 +669,10 @@ if page == "💬 Chatbot Q&A":
 
 if page == "🩹 Symptom Bot":
     t = TRANSLATIONS[output_lang]
-    load_dotenv()
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
+    # Use unified GEMINI_API_KEY
     if not GEMINI_API_KEY:
         st.error("Gemini API key not found. Please set GEMINI_API_KEY in .env file.")
         st.stop()
-
-    # Configure Gemini
-    genai.configure(api_key=GEMINI_API_KEY)
 
     # Load Gemini model
     try:
@@ -535,7 +696,7 @@ if page == "🩹 Symptom Bot":
         pregnant = t["no"]
 
     history = st.text_area(t["history"], placeholder=t["hist_example"])
-    symptoms = st.text_area(t["symptoms"], placeholder=t["symp_example"])
+    symptoms = st.text_area(t["symptoms"], placeholder=t.get("symp_example", TRANSLATIONS["en"].get("symp_example", "Example: high fever, lethargy...")))
     exam_findings = st.text_area(t["exam"], placeholder=t["exam_example"])
     lab_results = st.text_area(t["lab"], placeholder=t["lab_example"])
 
@@ -560,8 +721,9 @@ Lab Results: {lab_results}
             try:
                 response = model.generate_content(prompt)
                 result = response.text
+                translated_result = translate_answer(result, output_lang)
             except Exception as e:
-                result = f"❌ Error communicating with Gemini: {e}"
+                translated_result = f"❌ Error communicating with Gemini: {e}"
 
         # Output
         st.subheader("📄 " + t.get("summary", "Summary"))
@@ -574,5 +736,5 @@ Lab Results: {lab_results}
 **{t.get('vissum_lab', 'Lab results: ')}** {lab_results or t.get('none', 'none')}  
 """)
 
-        st.subheader("🧠 " + t["diagnostic"])
-        st.markdown(result)
+        st.subheader("🧠 " + t.get("diagnostic", TRANSLATIONS["en"].get("diagnostic", "Diagnostic")))
+        st.markdown(translated_result)

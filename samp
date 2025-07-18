@@ -1,0 +1,545 @@
+#frontend/app.py
+import streamlit as st
+import io
+import os
+import string
+import json
+import streamlit as st
+from transformers import pipeline
+import pyttsx3
+from dotenv import load_dotenv
+
+import google.generativeai as genai
+from dotenv import load_dotenv
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# -------------------------
+# Load Translations
+# -------------------------
+with open(os.path.join(os.path.dirname(__file__), "assets", "translations.json"), encoding="utf-8") as f:
+    TRANSLATIONS = json.load(f)
+
+
+# -------------------------
+# Utility Functions
+# -------------------------
+
+def translate_question(text, lang_code):
+    if lang_code == "en":
+        return text
+    model_map = {
+        "fr": "Helsinki-NLP/opus-mt-fr-en",
+        "es": "Helsinki-NLP/opus-mt-es-en",
+        "de": "Helsinki-NLP/opus-mt-de-en",
+        "hi": "Helsinki-NLP/opus-mt-hi-en",
+        "zh": "Helsinki-NLP/opus-mt-zh-en"
+    }
+    model_name = model_map.get(lang_code)
+    if not model_name:
+        return text
+    translator = pipeline("translation", model=model_name)
+    return translator(text, max_length=512)[0]['translation_text']
+
+
+def translate_answer(text, lang_code):
+    if lang_code == "en" or not text or not isinstance(text, str) or text.strip() == "":
+        return text
+    model_map = {
+        "fr": "Helsinki-NLP/opus-mt-en-fr",
+        "es": "Helsinki-NLP/opus-mt-en-es",
+        "de": "Helsinki-NLP/opus-mt-en-de",
+        "hi": "Helsinki-NLP/opus-mt-en-hi",
+        "zh": "Helsinki-NLP/opus-mt-en-zh"
+    }
+    model_name = model_map.get(lang_code)
+    if not model_name:
+        return text
+    try:
+        result = pipeline("translation", model=model_name)(text, max_length=512)
+        if result and isinstance(result, list) and 'translation_text' in result[0]:
+            return result[0]['translation_text']
+        else:
+            return text
+    except Exception as e:
+        return f"❌ Translation error: {e}"
+
+
+def is_greeting(text):
+    greetings = {"hi", "hello", "hey", "good morning", "good evening", 
+                 "bonjour", "salut", "hola", "hallo", "namaste", "你好"}
+    text_clean = text.lower().translate(str.maketrans('', '', string.punctuation)).strip()
+    return text_clean in greetings
+
+# -------------------------
+# Medical AI Utility Functions (from backend)
+# -------------------------
+from PIL import Image as PILImage
+import pdfplumber
+
+def ask_gemini(question, context="", tone="formal", simple=False, role="general_physician"):
+    tone_map = {
+        "formal": "Give a detailed medical explanation.",
+        "friendly": "Respond warmly and clearly.",
+        "child": "Explain like to a 10-year-old."
+    }
+    role_map = {
+        "radiologist": "You are a radiologist (a doctor who looks at medical images like X-rays).",
+        "general_physician": "You are a general physician (a doctor for general health problems).",
+        "orthopedist": "You are an orthopedist (a doctor who treats bone and joint issues).",
+        "cardiologist": "You are a cardiologist (a doctor who specializes in heart and blood vessels).",
+        "neurologist": "You are a neurologist (a doctor who treats brain and nervous system disorders).",
+        "dermatologist": "You are a dermatologist (a doctor who treats skin conditions).",
+        "pediatrician": "You are a pediatrician (a doctor who treats children).",
+        "dentist": "You are a dentist (a doctor who treats teeth and oral health)."
+    }
+    analysis_in_context = "Image Analysis:" in context or "PDF Analysis:" in context
+    role_instruction = role_map.get(role, "You are a helpful medical assistant.")
+    if analysis_in_context:
+        prompt = f"""{role_instruction}\nUse the following analysis results to answer the user's question in a clear, professional, and explanatory way. Reference the analysis and explain your reasoning as a doctor would.\nContext: {context}\nQuestion: {question}\nTone: {tone_map.get(tone, '')}\n\nAnswer:"""
+    elif simple:
+        prompt = f"""{role_instruction}\nContext: {context}\nQuestion: {question}\nPlease answer in 5-8 sentences, using simple words, as if explaining to a young child or someone with no medical background. The answer should be moderate in length, not too short and not too long. Avoid technical jargon and greetings.\n\nAnswer:"""
+    else:
+        prompt = f"""{role_instruction}\nContext: {context}\nQuestion: {question}\nTone: {tone_map.get(tone, '')}\n\nAnswer:"""
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    response = model.generate_content(prompt)
+    return response.text.strip()
+
+def analyze_image(image_path, role="radiologist"):
+    role_map = {
+        "radiologist": "You are a radiologist (a doctor who looks at medical images like X-rays).",
+        "general_physician": "You are a general physician (a doctor for general health problems).",
+        "orthopedist": "You are an orthopedist (a doctor who treats bone and joint issues).",
+        "cardiologist": "You are a cardiologist (a doctor who specializes in heart and blood vessels).",
+        "neurologist": "You are a neurologist (a doctor who treats brain and nervous system disorders).",
+        "dermatologist": "You are a dermatologist (a doctor who treats skin conditions).",
+        "pediatrician": "You are a pediatrician (a doctor who treats children).",
+        "dentist": "You are a dentist (a doctor who treats teeth and oral health)."
+    }
+    role_instruction = role_map.get(role, "You are a helpful medical assistant.")
+    prompt = f"{role_instruction} Analyze the medical image for abnormalities."
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    img = PILImage.open(image_path)
+    response = model.generate_content([prompt, img])
+    return response.text.strip()
+
+
+def highlight_medical_entities(text):
+    NER = pipeline("ner", model="dslim/bert-base-NER", grouped_entities=True)
+    entities = NER(text)
+    for ent in entities:
+        label = ent['entity_group']
+        word = ent['word']
+        emoji = {"DISEASE": "🦠", "SYMPTOM": "🤒", "MEDICATION": "💊"}.get(label.upper(), "🔍")
+        text = text.replace(word, f"**{emoji} {word}**")
+    return text
+
+# -------------------------
+# TTS Utility
+# -------------------------
+def synthesize_speech(text):
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 170)
+    engine.setProperty('volume', 1.0)
+    with io.BytesIO() as audio_file:
+        engine.save_to_file(text, 'temp_tts_output.mp3')
+        engine.runAndWait()
+        with open('temp_tts_output.mp3', 'rb') as f:
+            audio_bytes = f.read()
+        return audio_bytes
+
+def summarize_content(content, role="general_physician"):
+    role_map = {
+        "radiologist": "You are a radiologist (a doctor who looks at medical images like X-rays).",
+        "general_physician": "You are a general physician (a doctor for general health problems).",
+        "orthopedist": "You are an orthopedist (a doctor who treats bone and joint issues).",
+        "cardiologist": "You are a cardiologist (a doctor who specializes in heart and blood vessels).",
+        "neurologist": "You are a neurologist (a doctor who treats brain and nervous system disorders).",
+        "dermatologist": "You are a dermatologist (a doctor who treats skin conditions).",
+        "pediatrician": "You are a pediatrician (a doctor who treats children).",
+        "dentist": "You are a dentist (a doctor who treats teeth and oral health)."
+    }
+    role_instruction = role_map.get(role, "You are a helpful medical assistant.")
+    prompt = (
+        f"{role_instruction} Summarize the following medical report in simple, clear language. "
+        "Make it easy to understand for non-experts, avoid technical jargon, "
+        "and keep the summary moderately detailed (about 5-8 sentences, not too short, not too long). "
+        "Do not include greetings.\n\nReport:\n"
+        f"{content}\n\nSummary:"
+    )
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    response = model.generate_content(prompt)
+    return response.text.strip()
+
+def extract_text_from_pdf(path: str) -> str:
+    full_text = ""
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
+    return full_text.strip()
+
+# -------------------------
+# Page Configuration & CSS
+# -------------------------
+st.set_page_config(page_title=" Medical Assistant", page_icon="🩺", layout="wide")
+
+st.markdown("""
+    <style>
+        .main-title {
+            font-size: 2.5em;
+            font-weight: 800;
+            color: #003366;
+            margin-bottom: 0.5em;
+        }
+        .section-heading {
+            font-size: 1.6em;
+            font-weight: 700;
+            color: #1a1a1a;
+            margin-top: 2em;
+        }
+        .upload-box {
+            border: 2px dashed #ccc;
+            padding: 1em;
+            border-radius: 12px;
+            background-color: #f9f9f9;
+        }
+        .stDownloadButton>button {
+            background-color: #2E8B57 !important;
+            color: white !important;
+            font-weight: bold;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+
+# -------------------------
+# Sidebar Navigation
+# -------------------------
+
+
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../backend')))
+from model_utils import analyze_image as backend_analyze_image, ask_gemini as backend_ask_gemini
+from pdf_utils import extract_text_from_pdf as backend_extract_text_from_pdf
+
+st.sidebar.title("🩺 Medical Assistant")
+if "last_page" not in st.session_state:
+    st.session_state.last_page = "🏞️ Home"
+page = st.sidebar.radio("Navigate", [
+    "🏞️ Home", "🖼️ Image Analysis", "📄 PDF Report Analysis", "💬 Chatbot Q&A", "🩹 Symptom Bot"],
+    index=["🏞️ Home", "🖼️ Image Analysis", "📄 PDF Report Analysis", "💬 Chatbot Q&A", "🩹 Symptom Bot"].index(st.session_state.last_page) if "last_page" in st.session_state else 0)
+st.session_state.last_page = page
+
+
+
+# -------------------------
+# Session State Initialization
+# -------------------------
+for key in ["image_messages", "pdf_messages", "messages"]:
+    if key not in st.session_state:
+        st.session_state[key] = []
+for key in ["image_analysis", "pdf_analysis"]:
+    if key not in st.session_state:
+        st.session_state[key] = ""
+
+
+
+
+
+
+language_map = {
+    "en": "English",
+    "fr": "Français",
+    "es": "Español",
+    "de": "Deutsch",
+    "hi": "हिन्दी",
+    "zh": "中文"
+}
+output_lang = st.sidebar.selectbox(
+    "🌐 " + TRANSLATIONS["en"]["language_selection"],
+    list(language_map.keys()),
+    format_func=lambda x: language_map[x]
+)
+simple_explanation = st.sidebar.checkbox("📖 Simple explanation mode (for kids / non-experts)")
+tone = st.sidebar.selectbox("🧘 Tone:", ["formal", "friendly", "child"])
+
+
+
+# -------------------------
+# Home Page
+# -------------------------
+if page == "🏞️ Home":
+    t = TRANSLATIONS[output_lang]
+    st.title("🩺 " + t["page1_title"])
+    st.header(t["page1_header"])
+    st.markdown(t["page1_subheader"])
+
+# -------------------------
+# Image Analysis with Chat
+# -------------------------
+if page == "🖼️ Image Analysis":
+    t = TRANSLATIONS[output_lang]
+    st.subheader("🖼️ " + t["image_upload"])
+    image_file = st.file_uploader(t["image_upload"], type=["png", "jpg", "jpeg"])
+
+
+    if image_file:
+        try:
+            # Get file extension for temp file
+            import tempfile
+            import pathlib
+            file_ext = pathlib.Path(image_file.name).suffix.lower()
+            if file_ext not in [".png", ".jpg", ".jpeg"]:
+                st.error("❌ Unsupported image format. Please upload a PNG, JPG, or JPEG file.")
+                st.stop()
+            image_bytes = image_file.read()
+            # Save uploaded image to a temp file with correct extension
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_img:
+                tmp_img.write(image_bytes)
+                tmp_img_path = tmp_img.name
+            # Display image in Streamlit
+            try:
+                img = PILImage.open(tmp_img_path)
+                st.image(img, caption=t["image_upload"])
+            except Exception as e:
+                st.error(f"❌ Error displaying image: {e}")
+                st.stop()
+            with st.spinner(t["image_analysis"] + "..."):
+                try:
+                    result = backend_analyze_image(tmp_img_path, role="radiologist")
+                except Exception as e:
+                    st.error(f"❌ {t['backend_error']}: {e}")
+                    result = None
+                if result:
+                    st.session_state.image_analysis = result
+                    st.session_state.image_messages = []
+        except Exception as e:
+            st.error("❌ " + t.get("analysis_error", f"Error: {e}"))
+
+    if st.session_state.image_analysis:
+        st.divider()
+        st.subheader("� " + t.get("image_analysis_result", "Image Analysis Result"))
+        st.markdown(st.session_state.image_analysis)
+        st.subheader("�💬 " + t["ask_image_question"])
+        user_input = st.chat_input(t["ask_image_question"], key="image_chat")
+        if user_input:
+            st.session_state.image_messages.append(("user", user_input))
+            with st.spinner("Thinking..."):
+                history = [f"Image Analysis: {st.session_state.image_analysis}"]
+                for role_msg, msg in st.session_state.image_messages:
+                    history.append(f"{role_msg.capitalize()}: {msg}")
+                try:
+                    answer = backend_ask_gemini(
+                        user_input,
+                        context="\n".join(history),
+                        tone=tone,
+                        simple=simple_explanation,
+                        role="radiologist"
+                    )
+                except Exception as e:
+                    answer = f"❌ Error: {e}"
+                st.session_state.image_messages.append(("assistant", answer))
+        for idx, (role, msg) in enumerate(st.session_state.image_messages):
+            with st.chat_message(role):
+                st.markdown(msg)
+
+# -------------------------
+# PDF Report Analysis with Chat
+# -------------------------
+if page == "📄 PDF Report Analysis":
+    t_pdf = TRANSLATIONS.get(output_lang, TRANSLATIONS["en"])
+    st.subheader("📄 " + t_pdf.get("pdf_upload", TRANSLATIONS["en"]["pdf_upload"]))
+    pdf_file = st.file_uploader(t_pdf.get("pdf_upload", TRANSLATIONS["en"]["pdf_upload"]), type=["pdf"])
+
+
+    if pdf_file:
+        with st.spinner(t_pdf.get("pdf_analysis", TRANSLATIONS["en"]["pdf_analysis"]) + "..."):
+            pdf_file.seek(0)
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                tmp_pdf.write(pdf_file.read())
+                tmp_pdf_path = tmp_pdf.name
+            try:
+                result = backend_extract_text_from_pdf(tmp_pdf_path)
+            except Exception as e:
+                st.error(f"❌ {t_pdf.get('analysis_error', TRANSLATIONS['en']['analysis_error'])}: {e}")
+                result = None
+            if result:
+                st.session_state.pdf_analysis = result
+                st.session_state.pdf_messages = []
+
+    if st.session_state.pdf_analysis:
+        st.divider()
+        st.subheader("� " + t_pdf.get("pdf_analysis_result", "PDF Analysis Result"))
+        st.markdown(st.session_state.pdf_analysis)
+        st.subheader("�📁 " + t_pdf.get("ask_pdf_question", TRANSLATIONS["en"]["ask_pdf_question"]))
+        user_input = st.chat_input(t_pdf.get("ask_pdf_question", TRANSLATIONS["en"]["ask_pdf_question"]), key="pdf_chat")
+        if user_input:
+            st.session_state.pdf_messages.append(("user", user_input))
+            with st.spinner("Thinking..."):
+                history = [f"PDF Analysis: {st.session_state.pdf_analysis}"]
+                for role_msg, msg in st.session_state.pdf_messages:
+                    history.append(f"{role_msg.capitalize()}: {msg}")
+                try:
+                    answer = backend_ask_gemini(
+                        user_input,
+                        context="\n".join(history),
+                        tone=tone,
+                        simple=simple_explanation,
+                        role="general_physician"
+                    )
+                except Exception as e:
+                    answer = f"❌ Error: {e}"
+                st.session_state.pdf_messages.append(("assistant", answer))
+        for idx, (role, msg) in enumerate(st.session_state.pdf_messages):
+            with st.chat_message(role):
+                st.markdown(msg)
+
+# -------------------------
+# Chatbot Q&A
+# -------------------------
+if page == "💬 Chatbot Q&A":
+    t = TRANSLATIONS.get(output_lang, TRANSLATIONS["en"])
+    st.title("💬 " + t.get("chatbot_title", TRANSLATIONS["en"]["chatbot_title"]))
+    user_input = st.chat_input(t.get("chatbot_input", TRANSLATIONS["en"]["chatbot_input"]))
+    if user_input:
+        st.session_state.messages.append(("user", user_input))
+        user_msg = user_input
+        if is_greeting(user_msg):
+            st.session_state.messages.append(("assistant", t.get("greeting", TRANSLATIONS["en"]["greeting"])))
+        else:
+            with st.spinner("Thinking..."):
+                history = []
+                for role_msg, msg in st.session_state.messages:
+                    if role_msg == "user":
+                        history.append(f"User: {msg}")
+                    elif role_msg == "assistant":
+                        history.append(f"Assistant: {msg}")
+                if st.session_state.image_analysis:
+                    history.append(f"Image Analysis: {st.session_state.image_analysis}")
+                if st.session_state.pdf_analysis:
+                    history.append(f"PDF Analysis: {st.session_state.pdf_analysis}")
+                chat_history = "\n".join(history)
+                try:
+                    answer = backend_ask_gemini(
+                        user_msg,
+                        context=chat_history,
+                        tone=tone,
+                        simple=True,
+                        role="general_physician"
+                    )
+                except Exception as e:
+                    answer = f"❌ Error: {e}"
+                st.session_state.messages.append(("assistant", answer))
+    for idx, (role_label, msg) in enumerate(st.session_state.messages):
+        with st.chat_message(role_label):
+            st.markdown(msg)
+            if role_label == "assistant":
+                # TTS controls
+                if st.button(f"🔊 Play Voice {idx}", key=f"play_voice_{idx}"):
+                    st.session_state[f"tts_playing_{idx}"] = True
+                if st.session_state.get(f"tts_playing_{idx}", False):
+                    audio_bytes = synthesize_speech(msg)
+                    st.audio(audio_bytes, format='audio/mp3')
+                    if st.button(f"⏸️ Pause {idx}", key=f"pause_voice_{idx}"):
+                        st.session_state[f"tts_playing_{idx}"] = False
+                else:
+                    if st.button(f"▶️ Resume {idx}", key=f"resume_voice_{idx}"):
+                        st.session_state[f"tts_playing_{idx}"] = True
+
+
+# -------------------------
+# All backend-dependent features removed. Only Symptom Bot remains.
+
+
+
+
+
+
+
+
+
+
+# -------------------------
+# 🩹 Symptom Bot
+# -------------------------
+
+if page == "🩹 Symptom Bot":
+    t = TRANSLATIONS[output_lang]
+    load_dotenv()
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+    if not GEMINI_API_KEY:
+        st.error("Gemini API key not found. Please set GEMINI_API_KEY in .env file.")
+        st.stop()
+
+    # Configure Gemini
+    genai.configure(api_key=GEMINI_API_KEY)
+
+    # Load Gemini model
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+    except Exception as e:
+        st.error(f"Error loading Gemini model: {e}")
+        st.stop()
+
+    # Streamlit UI
+    st.title("🩺 " + t["symptom_bot_title"])
+    st.subheader("📝 " + t["symptom_bot_subheader"])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        gender = st.radio(t["gender"], [t["male"], t["female"]])
+    with col2:
+        age = st.number_input(t["age"], min_value=0, step=1)
+    if gender == t["female"]:
+        pregnant = st.radio(t["pregnant"], [t["no"], t["yes"]], horizontal=True)
+    else:
+        pregnant = t["no"]
+
+    history = st.text_area(t["history"], placeholder=t["hist_example"])
+    symptoms = st.text_area(t["symptoms"], placeholder=t["symp_example"])
+    exam_findings = st.text_area(t["exam"], placeholder=t["exam_example"])
+    lab_results = st.text_area(t["lab"], placeholder=t["lab_example"])
+
+    # Submit button
+    if st.button(t["submit"]):
+        with st.spinner(t["submit_wait"]):
+            prompt = f"""
+You are a medical diagnostic assistant. Given the patient data, provide:
+1. A summarized medical report.
+2. A list of possible differential diagnoses with short reasoning.
+
+Patient Info:
+- Gender: {gender}
+- Age: {age}
+- Pregnant: {pregnant}
+
+Medical History: {history}
+Symptoms: {symptoms}
+Examination Findings: {exam_findings}
+Lab Results: {lab_results}
+"""
+            try:
+                response = model.generate_content(prompt)
+                result = response.text
+            except Exception as e:
+                result = f"❌ Error communicating with Gemini: {e}"
+
+        # Output
+        st.subheader("📄 " + t.get("summary", "Summary"))
+        st.markdown(f"""
+**{t.get('vissum_patient', 'Patient: ')}** {gender}, {age}{t.get('vissum_yrsold', ' yrs old')}  
+**{t.get('vissum_pregnancy', 'Pregnancy: ')}** {pregnant}  
+**{t.get('vissum_history', 'History: ')}** {history or t.get('none', 'none')}  
+**{t.get('vissum_symp', 'Symptoms: ')}** {symptoms or t.get('none', 'none')}  
+**{t.get('vissum_exam', 'Exam findings: ')}** {exam_findings or t.get('none', 'none')}  
+**{t.get('vissum_lab', 'Lab results: ')}** {lab_results or t.get('none', 'none')}  
+""")
+
+        st.subheader("🧠 " + t["diagnostic"])
+        st.markdown(result)
