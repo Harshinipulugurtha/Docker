@@ -1,11 +1,9 @@
 #frontend/app.py
-
 import streamlit as st
 import requests
 from mic_utils import record_and_transcribe 
 from tts_utils import speak_text, generate_audio_html
 from ner_display import display_ner_highlighted
-
 import os
 import torch
 from transformers import pipeline
@@ -241,6 +239,21 @@ if page == "🏞️ Home":
     st.title("🩺 " + t["page1_title"])
     st.header(t["page1_header"])
     st.markdown(t["page1_subheader"])
+
+    # Load How to Use steps from translations.json
+    htu_steps = t.get("htu_steps")
+    if not htu_steps:
+        htu_steps = TRANSLATIONS["en"].get("htu_steps", [])
+    htu_container = t.get("htu_container", TRANSLATIONS["en"].get("htu_container"))
+    htu_heading = t.get("htu_heading", TRANSLATIONS["en"].get("htu_heading"))
+    st.markdown(
+        htu_container + "\n" +
+        htu_heading + "\n" +
+        "<ul style='font-size:1.1em; line-height:1.7;'>\n" +
+        "\n".join([f"  <li>{step}</li>" for step in htu_steps]) +
+        "\n</ul>\n</div>",
+        unsafe_allow_html=True
+    )
 
 # -------------------------
 # Image Analysis with Chat
